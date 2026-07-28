@@ -246,10 +246,7 @@ pub fn find_local_config(start_dir: &Path) -> Option<PathBuf> {
                 return Some(candidate);
             }
         }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => return None,
-        }
+        dir = dir.parent()?;
     }
 }
 
