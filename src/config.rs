@@ -101,10 +101,21 @@ pub struct DprintxConfig {
     /// "no edits" answer.
     #[serde(default = "default_lsp_timeout_ms")]
     pub lsp_timeout_ms: u64,
+
+    /// Pass `--no-gitignore` to backends so gitignored files still format in
+    /// the editor. Opening a file is already an explicit request for it, and
+    /// config excludes still decide what dprint owns.
+    /// Needs a dprint that accepts the flag on `lsp`.
+    #[serde(default = "default_lsp_no_gitignore")]
+    pub lsp_no_gitignore: bool,
 }
 
 fn default_lsp_timeout_ms() -> u64 {
     30_000
+}
+
+fn default_lsp_no_gitignore() -> bool {
+    true
 }
 
 impl DprintxConfig {
@@ -583,6 +594,26 @@ mod tests {
 
         // No match_content by default.
         assert!(config.match_content.is_none());
+
+        // LSP defaults apply to configs written before these knobs existed.
+        assert_eq!(config.lsp_timeout_ms, 30_000);
+        assert!(config.lsp_no_gitignore);
+    }
+
+    #[test]
+    fn test_lsp_options_are_overridable() {
+        let input = r#"{
+  "dprint": "dprint",
+  "profiles": { "default": "~/.config/dprint/dprint-default.jsonc" },
+  "match": { "**": "default" },
+  "lsp_timeout_ms": 5000,
+  "lsp_no_gitignore": false,
+}"#;
+        let json = strip_jsonc_comments(input);
+        let config: DprintxConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(config.lsp_timeout_ms, 5000);
+        assert!(!config.lsp_no_gitignore);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::config::{self, DprintxConfig, ProfileResolution};
@@ -487,9 +487,32 @@ impl LspProxy {
         Ok(())
     }
 
+    /// Whether the backend understands `lsp --no-gitignore`. Older dprint
+    /// versions reject the flag outright, so ask before using it.
+    fn backend_takes_no_gitignore(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            Command::new(&self.dprint_bin)
+                .args(["lsp", "--help"])
+                .output()
+                // dprint prints subcommand help on stderr, so check both.
+                .map(|out| {
+                    let help = String::from_utf8_lossy(&out.stdout).into_owned()
+                        + &String::from_utf8_lossy(&out.stderr);
+                    help.contains("--no-gitignore")
+                })
+                .unwrap_or(false)
+        })
+    }
+
     fn spawn_backend(&self, config_path: &PathBuf) -> Result<Backend> {
-        let mut child = Command::new(&self.dprint_bin)
-            .args(["lsp", "--config"])
+        let mut cmd = Command::new(&self.dprint_bin);
+        cmd.arg("lsp");
+        if self.config.lsp_no_gitignore && self.backend_takes_no_gitignore() {
+            cmd.arg("--no-gitignore");
+        }
+        let mut child = cmd
+            .arg("--config")
             .arg(config_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
