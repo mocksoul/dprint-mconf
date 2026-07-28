@@ -81,6 +81,13 @@ fn apply_uri_rewrite(msg: &mut serde_json::Value, uri_languages: &HashMap<String
     }
 }
 
+/// Whether `lsp --help` advertises `--no-gitignore`. dprint prints subcommand
+/// help on stderr, so both streams are searched.
+fn help_mentions_no_gitignore(stdout: &[u8], stderr: &[u8]) -> bool {
+    let help = String::from_utf8_lossy(stdout).into_owned() + &String::from_utf8_lossy(stderr);
+    help.contains("--no-gitignore")
+}
+
 /// LSP proxy: spawns dprint lsp per profile, routes requests by file URI.
 pub struct LspProxy {
     dprint_bin: PathBuf,
@@ -495,12 +502,7 @@ impl LspProxy {
             Command::new(&self.dprint_bin)
                 .args(["lsp", "--help"])
                 .output()
-                // dprint prints subcommand help on stderr, so check both.
-                .map(|out| {
-                    let help = String::from_utf8_lossy(&out.stdout).into_owned()
-                        + &String::from_utf8_lossy(&out.stderr);
-                    help.contains("--no-gitignore")
-                })
+                .map(|out| help_mentions_no_gitignore(&out.stdout, &out.stderr))
                 .unwrap_or(false)
         })
     }
@@ -727,6 +729,41 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Trimmed `dprint lsp --help` from a build without the flag.
+    const OLD_HELP: &[u8] = b"Starts up a language server for formatting files.
+
+Usage: dprint lsp [OPTIONS]
+
+Options:
+  -c, --config <config>             Path or url to JSON configuration file.
+      --config-discovery=<BOOLEAN>  Sets the config discovery mode.
+";
+
+    #[test]
+    fn test_help_detection_on_old_dprint() {
+        // Old dprint rejects the flag outright, so it must not be sent.
+        assert!(!help_mentions_no_gitignore(b"", OLD_HELP));
+        assert!(!help_mentions_no_gitignore(OLD_HELP, b""));
+    }
+
+    #[test]
+    fn test_help_detection_on_new_dprint() {
+        let new_help = b"Options:
+      --no-gitignore                Format files that are gitignored.
+  -c, --config <config>             Path or url to JSON configuration file.
+";
+        // dprint writes subcommand help to stderr, but do not depend on that.
+        assert!(help_mentions_no_gitignore(b"", new_help));
+        assert!(help_mentions_no_gitignore(new_help, b""));
+    }
+
+    #[test]
+    fn test_help_detection_on_unreadable_output() {
+        // A binary that fails or prints nothing is treated as unsupported.
+        assert!(!help_mentions_no_gitignore(b"", b""));
+        assert!(!help_mentions_no_gitignore(&[0xff, 0xfe], &[0xff]));
+    }
 
     #[test]
     fn test_uri_to_path() {
