@@ -11,7 +11,9 @@ A wrapper around [dprint](https://dprint.dev/) that adds multi-config support an
   profile via `extends`
 - **[Unified diff output](#diff_pager)** — `dprint check` with real unified diff and optional pager
   ([dprint#1092](https://github.com/dprint/dprint/issues/1092))
-- **[LSP proxy](#cli)** — spawns per-profile `dprint lsp` backends, routes requests by file URI
+- **[LSP proxy](#lsp-proxy)** — spawns per-profile `dprint lsp` backends, routes requests by file URI
+- **[LSP gitignore handling](#lsp-gitignore-handling)** — format gitignored files in the editor, where opening a file is
+  already an explicit request ([dprint#1124](https://github.com/dprint/dprint/issues/1124))
 - **[LSP URI rewriting](#lsp-uri-rewriting)** — format extensionless files (shell scripts, etc.) by appending the
   correct extension based on editor's `languageId`
 - **[Directory arguments](#directory-arguments)** — pass directories to `fmt`/`check`, scoped via dprint's file
@@ -29,6 +31,8 @@ Config file: `~/.config/dprint/dprintx.jsonc`
 
   "diff_pager": "delta -s",
   "lsp_rewrite_uris": true,
+  "lsp_no_gitignore": true, // default
+  "lsp_timeout_ms": 30000, // default
 
   "profiles": {
     "maintainer": "~/.config/dprint/dprint-maintainer.jsonc",
@@ -147,7 +151,8 @@ When formatting files under `~/projects/my-app/`, dprintx generates a temporary 
 The profile path is always prepended so that local settings win.
 
 **Temp file location:** `$XDG_RUNTIME_DIR/dprintx/` (per-user, mode 700). Falls back to `$TMPDIR/dprintx/` if
-`XDG_RUNTIME_DIR` is unavailable. Files are named `merged-{pid}-{seq}.json` and cleaned up automatically.
+`XDG_RUNTIME_DIR` is unavailable. Files are named `merged-{pid}-{seq}.json` and cleaned up automatically. Files left
+behind by a killed process are removed on the next run, matched by their pid.
 
 If no local config is found, the profile config is used directly — no temp file is created.
 
@@ -165,6 +170,48 @@ dprintx fmt a.go src/ b.rs          # mix of files and directories works too
 Files are passed through as-is. Directories use the same pipeline as `dprintx fmt`/`dprintx check` without arguments —
 dprint discovers files via its own includes/excludes, then dprintx filters by profile match rules. This naturally skips
 binary files, build artifacts, and anything dprint wouldn't process on its own.
+
+### LSP proxy
+
+`dprintx lsp` speaks LSP to the editor and runs one `dprint lsp` backend per effective config, spawned on first use and
+keyed by config path. Requests are routed by file URI, so one editor session can span projects with different profiles.
+[Merged configs](#local-config-overrides) are built once per project directory and reused, which keeps that count at one
+backend per project rather than one per file.
+
+Each backend is told which directory it serves: the project root for a local config, otherwise the workspace folder the
+editor reported. That directory anchors the profile's `includes`/`excludes` globs, which is what lets a config stored in
+`~/.config/dprint/` format files anywhere on disk.
+
+### LSP gitignore handling
+
+> **Enabled by default.** Disable with `"lsp_no_gitignore": false`.
+
+dprint skips gitignored files. That is right for `dprint fmt *`, where a shell glob may sweep in `node_modules`, but
+wrong in an editor: opening a file is already an explicit request to format it.
+
+When enabled, the proxy passes `--no-gitignore` to each backend, so gitignored files format normally. Config `excludes`
+still apply — they describe what dprint owns, which is a separate question from what git tracks.
+
+```jsonc
+{
+  "lsp_no_gitignore": false, // let backends respect .gitignore
+}
+```
+
+This needs a dprint that accepts `--no-gitignore` on `lsp`, which upstream does not have yet. The proxy checks
+`lsp --help` once per run and leaves the flag off when the backend doesn't support it, so stock dprint keeps working —
+the option simply has no effect.
+
+### LSP request timeout
+
+Backends compile wasm plugins on their first request, which takes seconds on a cold cache. The proxy waits 30s for a
+response before giving up; lower it if you prefer a fast failure:
+
+```jsonc
+{
+  "lsp_timeout_ms": 5000, // default: 30000
+}
+```
 
 ### LSP URI rewriting (opt-in)
 
