@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::{self, DprintxConfig, ProfileResolution};
@@ -9,6 +9,39 @@ use crate::matcher::ProfileMatcher;
 /// Runs the real dprint binary with appropriate config.
 pub struct DprintRunner {
     dprint_bin: std::path::PathBuf,
+}
+
+/// The directory dprint should run in when handed `files`.
+///
+/// dprint anchors a `--config` to the directory it runs in, so inheriting the
+/// caller's cwd makes the outcome depend on where the command was typed: an
+/// editor or hook formatting an absolute path from elsewhere gets "no files
+/// found" instead of a formatted file. The files themselves say where they
+/// belong, so use their deepest common directory.
+fn run_dir(files: &[impl AsRef<Path>]) -> Option<PathBuf> {
+    let mut common: Option<PathBuf> = None;
+
+    for file in files {
+        let abs = std::fs::canonicalize(file.as_ref()).ok()?;
+        let dir = abs.parent()?.to_path_buf();
+        common = Some(match common {
+            None => dir,
+            Some(current) => {
+                let shared = current
+                    .components()
+                    .zip(dir.components())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a)
+                    .collect::<PathBuf>();
+                if shared.as_os_str().is_empty() {
+                    return None;
+                }
+                shared
+            }
+        });
+    }
+
+    common
 }
 
 impl DprintRunner {
@@ -62,12 +95,16 @@ impl DprintRunner {
             .context("reading stdin")?;
 
         // Run: dprint fmt --stdin <filename> --config <config_path>
-        let mut child = Command::new(&self.dprint_bin)
-            .args(["fmt", "--stdin", filename, "--config"])
+        let mut cmd = Command::new(&self.dprint_bin);
+        cmd.args(["fmt", "--stdin", filename, "--config"])
             .arg(effective_config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(dir) = abs_path.parent() {
+            cmd.current_dir(dir);
+        }
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning dprint: {}", self.dprint_bin.display()))?;
 
@@ -271,6 +308,9 @@ impl DprintRunner {
             for f in group_files {
                 cmd.arg(f);
             }
+            if let Some(dir) = run_dir(group_files) {
+                cmd.current_dir(dir);
+            }
 
             let status = cmd.status().with_context(|| {
                 format!("running dprint fmt --config {}", config_path.display())
@@ -426,6 +466,9 @@ impl DprintRunner {
             for f in files {
                 cmd.arg(f);
             }
+            if let Some(dir) = run_dir(files) {
+                cmd.current_dir(dir);
+            }
 
             let status = cmd.status().with_context(|| {
                 format!(
@@ -490,6 +533,9 @@ impl DprintRunner {
             cmd.arg("check").arg("--config").arg(config_path);
             for f in group_files {
                 cmd.arg(f);
+            }
+            if let Some(dir) = run_dir(group_files) {
+                cmd.current_dir(dir);
             }
 
             let status = cmd.status().with_context(|| {
@@ -641,12 +687,16 @@ impl DprintRunner {
         let original = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
 
         // Format via dprint.
-        let mut child = Command::new(&self.dprint_bin)
-            .args(["fmt", "--stdin", file, "--config"])
+        let mut cmd = Command::new(&self.dprint_bin);
+        cmd.args(["fmt", "--stdin", file, "--config"])
             .arg(config_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(dir) = run_dir(&[file]) {
+            cmd.current_dir(dir);
+        }
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning dprint fmt --stdin {file}"))?;
 
@@ -730,5 +780,57 @@ impl DprintRunner {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn test_run_dir_single_file() {
+        let dir = scratch("dprintx-rundir-single");
+        let file = dir.join("a.md");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(run_dir(&[&file]), Some(dir.clone()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_dir_shared_parent() {
+        let dir = scratch("dprintx-rundir-shared");
+        let sub = dir.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = dir.join("a.md");
+        let b = sub.join("b.md");
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+
+        // Deepest directory holding both, so a config found from there covers
+        // every file handed to dprint.
+        assert_eq!(run_dir(&[&a, &b]), Some(dir.clone()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_dir_missing_file() {
+        // Nothing to anchor to: leave the cwd alone rather than guess.
+        assert_eq!(run_dir(&[PathBuf::from("/nonexistent/x.md")]), None);
+    }
+
+    #[test]
+    fn test_run_dir_empty() {
+        let empty: [PathBuf; 0] = [];
+        assert_eq!(run_dir(&empty), None);
     }
 }
