@@ -94,6 +94,17 @@ pub struct DprintxConfig {
     /// Default: false (transparent passthrough).
     #[serde(default)]
     pub lsp_rewrite_uris: bool,
+
+    /// How long to wait for a backend reply, in milliseconds.
+    /// The first request against a config compiles its wasm plugins, which
+    /// takes seconds, so a short timeout turns a cold start into a silent
+    /// "no edits" answer.
+    #[serde(default = "default_lsp_timeout_ms")]
+    pub lsp_timeout_ms: u64,
+}
+
+fn default_lsp_timeout_ms() -> u64 {
+    30_000
 }
 
 impl DprintxConfig {
@@ -342,7 +353,51 @@ fn merged_config_dir() -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating merged config dir: {}", dir.display()))?;
 
+    clean_orphaned_configs(&dir);
+
     Ok(dir)
+}
+
+/// Remove merged configs left behind by processes that are gone.
+///
+/// The `TempConfig` guard deletes the file on drop, but a killed process never
+/// drops anything, so the directory accumulates files across crashes. The pid
+/// in the name says who owned it; if that process is gone, so is the need.
+fn clean_orphaned_configs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let own_pid = std::process::id();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("merged-") else {
+            continue;
+        };
+        let Some((pid, _)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+
+        if pid != own_pid && !process_exists(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    // Without a cheap liveness check, keep the file: leaking beats deleting a
+    // config another process is still using.
+    true
 }
 
 /// Expand ~ to home directory in a path string.
@@ -908,6 +963,32 @@ mod tests {
         // This test might find a real dprint.json somewhere up the tree,
         // so we just verify the function doesn't crash.
         let _ = find_local_config(&dir);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_clean_orphaned_configs() {
+        let dir = std::env::temp_dir().join("dprintx-test-orphans");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // pid 0 is never a real process, so this file is unowned.
+        let orphan = dir.join("merged-0-1.json");
+        // The current process is alive, so its file must survive.
+        let own = dir.join(format!("merged-{}-1.json", std::process::id()));
+        // Anything not matching the naming scheme is none of our business.
+        let unrelated = dir.join("notes.json");
+
+        for path in [&orphan, &own, &unrelated] {
+            std::fs::write(path, "{}").unwrap();
+        }
+
+        clean_orphaned_configs(&dir);
+
+        assert!(!orphan.exists(), "orphaned config should be removed");
+        assert!(own.exists(), "live process config should be kept");
+        assert!(unrelated.exists(), "unrelated file should be kept");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

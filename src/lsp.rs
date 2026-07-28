@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -11,7 +12,8 @@ use crate::config::{self, DprintxConfig, ProfileResolution};
 use crate::matcher::ProfileMatcher;
 
 /// Timeout for reading LSP responses from backends.
-const READ_TIMEOUT: Duration = Duration::from_secs(1);
+/// Fallback when no proxy config is loaded.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Map LSP languageId to file extension (without dot).
 /// Used to rewrite URIs so dprint can match files by extension
@@ -106,7 +108,7 @@ impl LspProxy {
     pub fn run(&self) -> Result<()> {
         eprintln!(
             "dprintx: lsp proxy starting (timeout={}ms)",
-            READ_TIMEOUT.as_millis()
+            self.read_timeout().as_millis()
         );
 
         // Map: profile config path -> backend.
@@ -121,10 +123,15 @@ impl LspProxy {
         // Track initialize state for lazy backend spawning.
         let mut _initialized = false;
         let mut last_init_params: Option<serde_json::Value> = None;
-        // Hold merged config guards alive for the lifetime of LSP backends.
-        let mut _merged_guards: Vec<config::TempConfig> = Vec::new();
+        // Merged configs, keyed by the directory whose local config was merged.
+        // Every message carrying a URI would otherwise write a fresh temp file
+        // and spawn a backend for it, since each file gets a unique name.
+        let mut merged_configs: HashMap<PathBuf, config::TempConfig> = HashMap::new();
         // Track URI -> languageId from textDocument/didOpen for URI rewriting.
         let mut uri_languages: HashMap<String, String> = HashMap::new();
+        // Open documents, kept so a backend spawned later still learns about
+        // them: a backend that never saw didOpen has no text to format.
+        let mut open_docs: HashMap<String, serde_json::Value> = HashMap::new();
         let rewrite_uris = self.config.lsp_rewrite_uris;
 
         loop {
@@ -169,17 +176,10 @@ impl LspProxy {
                         backends_lock.insert(config_path.clone(), backend);
                         drop(backends_lock);
 
-                        // Send initialize to this backend.
-                        // Override rootUri to the config file's directory so dprint
-                        // knows which workspace this backend serves.
-                        let mut init_params = params.clone().unwrap_or(serde_json::json!({}));
-                        if let Some(config_dir) = config_path.parent() {
-                            let root_uri = format!("file://{}", config_dir.display());
-                            init_params["rootUri"] = serde_json::Value::String(root_uri.clone());
-                            // Also set rootPath for older LSP compat.
-                            init_params["rootPath"] =
-                                serde_json::Value::String(config_dir.display().to_string());
-                        }
+                        // Send initialize to this backend. A profile config lives in
+                        // ~/.config/dprint and says nothing about where the code is,
+                        // so pass the editor's own workspace through untouched.
+                        let init_params = params.clone().unwrap_or(serde_json::json!({}));
                         let init_msg = serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -275,6 +275,7 @@ impl LspProxy {
                         && let Some(uri) = extract_uri(&parsed)
                     {
                         uri_languages.remove(&uri);
+                        open_docs.remove(&uri);
                     }
 
                     // Clone and optionally rewrite URI based on languageId.
@@ -285,6 +286,14 @@ impl LspProxy {
                     }
                     // Use rewritten URI for routing, fall back to original.
                     let uri = extract_uri(&msg).or(original_uri);
+
+                    // Store the rewritten form: that is what a backend would
+                    // have received had it existed at the time.
+                    if method_name == "textDocument/didOpen"
+                        && let Some(uri) = &uri
+                    {
+                        open_docs.insert(uri.clone(), msg.clone());
+                    }
 
                     if let Some(uri) = uri {
                         let file_path = uri_to_path(&uri);
@@ -309,21 +318,39 @@ impl LspProxy {
                             };
 
                         // Resolve effective config (merged local + profile, or just profile).
-                        let effective_config = if let Some(parent) = file_path.parent() {
-                            match config::build_merged_config(parent, &profile_config) {
-                                Ok(Some(tc)) => {
-                                    let p = tc.path().to_path_buf();
-                                    _merged_guards.push(tc);
-                                    p
+                        // `workspace_root` is the directory the backend should treat as its
+                        // root: the project owning the local config, or whatever the editor
+                        // opened. Never the config's own directory -- a profile lives in
+                        // ~/.config/dprint and a merged config in a temp dir, and neither
+                        // contains the files being formatted.
+                        let mut workspace_root = None;
+                        let effective_config = match file_path.parent() {
+                            Some(parent) => match config::find_local_config(parent) {
+                                Some(local) if local != profile_config => {
+                                    let local_dir = local.parent().unwrap_or(parent).to_path_buf();
+                                    workspace_root = Some(local_dir.clone());
+                                    match merged_configs.entry(local_dir) {
+                                        Entry::Occupied(e) => e.get().path().to_path_buf(),
+                                        Entry::Vacant(e) => {
+                                            match config::build_merged_config(
+                                                parent,
+                                                &profile_config,
+                                            ) {
+                                                Ok(Some(tc)) => e.insert(tc).path().to_path_buf(),
+                                                Ok(None) => profile_config,
+                                                Err(err) => {
+                                                    eprintln!(
+                                                        "dprintx: warning: build_merged_config failed: {err}"
+                                                    );
+                                                    profile_config
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                                Ok(None) => profile_config,
-                                Err(e) => {
-                                    eprintln!("dprintx: warning: build_merged_config failed: {e}");
-                                    profile_config
-                                }
-                            }
-                        } else {
-                            profile_config
+                                _ => profile_config,
+                            },
+                            None => profile_config,
                         };
 
                         // Ensure backend is spawned (lazily for merged configs).
@@ -339,13 +366,8 @@ impl LspProxy {
                                 // Send initialize to the new backend.
                                 if let Some(init_params) = &last_init_params {
                                     let mut params = init_params.clone();
-                                    if let Some(config_dir) = effective_config.parent() {
-                                        let root_uri = format!("file://{}", config_dir.display());
-                                        params["rootUri"] =
-                                            serde_json::Value::String(root_uri.clone());
-                                        params["rootPath"] = serde_json::Value::String(
-                                            config_dir.display().to_string(),
-                                        );
+                                    if let Some(root) = workspace_root.as_deref() {
+                                        set_root(&mut params, root);
                                     }
                                     let init_msg = serde_json::json!({
                                         "jsonrpc": "2.0",
@@ -376,6 +398,14 @@ impl LspProxy {
                                         &effective_config,
                                         &initialized_msg,
                                     );
+
+                                    // Replay open documents. This backend missed
+                                    // every didOpen sent before it existed, and
+                                    // formatting reads from that document store.
+                                    for doc in open_docs.values() {
+                                        let _ =
+                                            self.send_to_backend(&backends, &effective_config, doc);
+                                    }
                                 }
                             }
                         }
@@ -386,7 +416,12 @@ impl LspProxy {
                         // If it's a request (has id), read response.
                         if let Some(id) = parsed.get("id").cloned() {
                             let t0 = std::time::Instant::now();
-                            match self.read_from_backend(&backends, &effective_config, &stdout) {
+                            match self.read_from_backend_matching(
+                                &backends,
+                                &effective_config,
+                                &stdout,
+                                Some(&id),
+                            ) {
                                 Ok(resp) => {
                                     eprintln!(
                                         "dprintx: {} responded in {:?}",
@@ -500,20 +535,34 @@ impl LspProxy {
         Ok(())
     }
 
-    /// Read a response from a backend, skipping notifications.
-    /// Notifications (messages without "id") are forwarded to the editor.
-    fn read_from_backend(
+    fn read_timeout(&self) -> Duration {
+        match self.config.lsp_timeout_ms {
+            0 => READ_TIMEOUT,
+            ms => Duration::from_millis(ms),
+        }
+    }
+
+    /// Read the response to `expect_id` from a backend.
+    ///
+    /// Notifications are forwarded to the editor as they arrive. So are replies
+    /// to other requests: a backend advertising hover and completion answers
+    /// several requests at once, and returning whichever reply lands first would
+    /// hand the editor an answer to a question it asked about something else.
+    /// `None` keeps the old behaviour of taking the first reply, for call sites
+    /// that discard the result anyway.
+    fn read_from_backend_matching(
         &self,
         backends: &Arc<Mutex<HashMap<PathBuf, Backend>>>,
         config_path: &PathBuf,
         stdout: &Arc<Mutex<io::Stdout>>,
+        expect_id: Option<&serde_json::Value>,
     ) -> Result<String> {
         let backends_lock = backends.lock().unwrap();
         let backend = backends_lock
             .get(config_path)
             .context("backend not found")?;
 
-        let deadline = std::time::Instant::now() + READ_TIMEOUT;
+        let deadline = std::time::Instant::now() + self.read_timeout();
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -527,14 +576,30 @@ impl LspProxy {
 
             // Check if this is a response (has "id") or a notification.
             let parsed: serde_json::Value = serde_json::from_str(&msg)?;
-            if parsed.get("id").is_some() {
-                // It's a response — return it.
-                return Ok(msg);
+            if let Some(id) = parsed.get("id") {
+                match expect_id {
+                    Some(expected) if id != expected => {
+                        // Someone else's reply: pass it through and keep waiting.
+                        let _ = write_lsp_message(stdout, &msg);
+                        continue;
+                    }
+                    _ => return Ok(msg),
+                }
             }
 
             // It's a notification — forward to editor and keep waiting.
             let _ = write_lsp_message(stdout, &msg);
         }
+    }
+
+    /// Read the next response from a backend, whatever request it belongs to.
+    fn read_from_backend(
+        &self,
+        backends: &Arc<Mutex<HashMap<PathBuf, Backend>>>,
+        config_path: &PathBuf,
+        stdout: &Arc<Mutex<io::Stdout>>,
+    ) -> Result<String> {
+        self.read_from_backend_matching(backends, config_path, stdout, None)
     }
 }
 
@@ -580,6 +645,23 @@ fn write_lsp_message(stdout: &Arc<Mutex<io::Stdout>>, body: &str) -> Result<()> 
 
 /// Extract file URI from LSP params.
 /// Looks for params.textDocument.uri.
+/// Point `initialize` params at the directory a backend should call its root.
+///
+/// Each backend serves exactly one config, so it gets exactly one folder --
+/// dprintx is what decides which config covers which directory. All three
+/// fields are set because a client only reads the newest one it understands,
+/// and dprint prefers `workspaceFolders` over the deprecated `rootUri`.
+fn set_root(params: &mut serde_json::Value, root: &Path) {
+    let uri = format!("file://{}", root.display());
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| uri.clone());
+    params["workspaceFolders"] = serde_json::json!([{ "uri": uri, "name": name }]);
+    params["rootUri"] = serde_json::Value::String(uri);
+    params["rootPath"] = serde_json::Value::String(root.display().to_string());
+}
+
 fn extract_uri(msg: &serde_json::Value) -> Option<String> {
     msg.get("params")?
         .get("textDocument")?
@@ -724,6 +806,44 @@ mod tests {
             msg["params"]["textDocument"]["uri"],
             "file:///home/user/myscript.sh"
         );
+    }
+
+    #[test]
+    fn test_set_root_replaces_editor_workspace() {
+        // The editor opened one project; this backend serves another.
+        let mut params = serde_json::json!({
+            "rootUri": "file:///home/user/other",
+            "rootPath": "/home/user/other",
+            "workspaceFolders": [{ "uri": "file:///home/user/other", "name": "other" }],
+            "capabilities": {},
+        });
+
+        set_root(&mut params, Path::new("/home/user/project"));
+
+        assert_eq!(params["rootUri"], "file:///home/user/project");
+        assert_eq!(params["rootPath"], "/home/user/project");
+        assert_eq!(
+            params["workspaceFolders"],
+            serde_json::json!([{ "uri": "file:///home/user/project", "name": "project" }])
+        );
+        // Untouched fields survive.
+        assert_eq!(params["capabilities"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_set_root_single_folder_only() {
+        // A backend serves exactly one config, so it must not inherit a list of
+        // folders the editor happened to have open.
+        let mut params = serde_json::json!({
+            "workspaceFolders": [
+                { "uri": "file:///a", "name": "a" },
+                { "uri": "file:///b", "name": "b" },
+            ],
+        });
+
+        set_root(&mut params, Path::new("/home/user/project"));
+
+        assert_eq!(params["workspaceFolders"].as_array().unwrap().len(), 1);
     }
 
     #[test]
