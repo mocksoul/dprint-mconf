@@ -58,6 +58,7 @@ impl DprintRunner {
         filename: &str,
         matcher: &ProfileMatcher,
         config: &DprintxConfig,
+        flags: &[String],
     ) -> Result<()> {
         let abs_path =
             std::fs::canonicalize(filename).unwrap_or_else(|_| std::path::PathBuf::from(filename));
@@ -98,6 +99,7 @@ impl DprintRunner {
         let mut cmd = Command::new(&self.dprint_bin);
         cmd.args(["fmt", "--stdin", filename, "--config"])
             .arg(effective_config)
+            .args(flags)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -272,6 +274,7 @@ impl DprintRunner {
         files: &[String],
         matcher: &ProfileMatcher,
         config: &DprintxConfig,
+        flags: &[String],
     ) -> Result<()> {
         // Hold all merged config guards alive until dprint finishes.
         let mut _guards: Vec<config::TempConfig> = Vec::new();
@@ -304,7 +307,7 @@ impl DprintRunner {
         let mut failed = false;
         for (config_path, group_files) in &groups {
             let mut cmd = Command::new(&self.dprint_bin);
-            cmd.arg("fmt").arg("--config").arg(config_path);
+            cmd.arg("fmt").arg("--config").arg(config_path).args(flags);
             for f in group_files {
                 cmd.arg(f);
             }
@@ -333,8 +336,13 @@ impl DprintRunner {
     ///
     /// For each profile, runs `dprint output-file-paths --config <profile>` to get the
     /// file list, filters by match rules, then runs `dprint fmt --config <profile> <files>`.
-    pub fn fmt_all(&self, matcher: &ProfileMatcher, config: &DprintxConfig) -> Result<()> {
-        self.run_all("fmt", matcher, config, None)
+    pub fn fmt_all(
+        &self,
+        matcher: &ProfileMatcher,
+        config: &DprintxConfig,
+        flags: &[String],
+    ) -> Result<()> {
+        self.run_all("fmt", matcher, config, None, flags)
     }
 
     /// Format files under specific directories using all profiles.
@@ -343,17 +351,23 @@ impl DprintRunner {
         dirs: &[PathBuf],
         matcher: &ProfileMatcher,
         config: &DprintxConfig,
+        flags: &[String],
     ) -> Result<()> {
-        self.run_all("fmt", matcher, config, Some(dirs))
+        self.run_all("fmt", matcher, config, Some(dirs), flags)
     }
 
     /// Check all files using all profiles.
     /// If diff_pager is configured, produces unified diff output.
-    pub fn check_all(&self, matcher: &ProfileMatcher, config: &DprintxConfig) -> Result<()> {
+    pub fn check_all(
+        &self,
+        matcher: &ProfileMatcher,
+        config: &DprintxConfig,
+        flags: &[String],
+    ) -> Result<()> {
         if config.diff_pager.is_some() {
-            return self.check_diff_all(matcher, config, None);
+            return self.check_diff_all(matcher, config, None, flags);
         }
-        self.run_all("check", matcher, config, None)
+        self.run_all("check", matcher, config, None, flags)
     }
 
     /// Check files under specific directories using all profiles.
@@ -362,11 +376,12 @@ impl DprintRunner {
         dirs: &[PathBuf],
         matcher: &ProfileMatcher,
         config: &DprintxConfig,
+        flags: &[String],
     ) -> Result<()> {
         if config.diff_pager.is_some() {
-            return self.check_diff_all(matcher, config, Some(dirs));
+            return self.check_diff_all(matcher, config, Some(dirs), flags);
         }
-        self.run_all("check", matcher, config, Some(dirs))
+        self.run_all("check", matcher, config, Some(dirs), flags)
     }
 
     /// Run a subcommand (fmt/check) for all profiles.
@@ -378,6 +393,7 @@ impl DprintRunner {
         matcher: &ProfileMatcher,
         config: &DprintxConfig,
         dir_filter: Option<&[PathBuf]>,
+        flags: &[String],
     ) -> Result<()> {
         let mut failed = false;
 
@@ -462,7 +478,10 @@ impl DprintRunner {
             }
 
             let mut cmd = Command::new(&self.dprint_bin);
-            cmd.arg(subcmd).arg("--config").arg(effective_config);
+            cmd.arg(subcmd)
+                .arg("--config")
+                .arg(effective_config)
+                .args(flags);
             for f in files {
                 cmd.arg(f);
             }
@@ -496,6 +515,7 @@ impl DprintRunner {
         files: &[String],
         matcher: &ProfileMatcher,
         config: &DprintxConfig,
+        flags: &[String],
     ) -> Result<()> {
         if config.diff_pager.is_some() {
             return self.check_diff_files(files, matcher, config);
@@ -530,7 +550,10 @@ impl DprintRunner {
         let mut failed = false;
         for (config_path, group_files) in &groups {
             let mut cmd = Command::new(&self.dprint_bin);
-            cmd.arg("check").arg("--config").arg(config_path);
+            cmd.arg("check")
+                .arg("--config")
+                .arg(config_path)
+                .args(flags);
             for f in group_files {
                 cmd.arg(f);
             }
@@ -563,6 +586,10 @@ impl DprintRunner {
         matcher: &ProfileMatcher,
         config: &DprintxConfig,
         dir_filter: Option<&[PathBuf]>,
+        // Diff output is produced by dprintx from `fmt --stdin`, so dprint's own
+        // check flags have nothing to act on here. Accepted to keep the call sites
+        // uniform with the non-diff path.
+        _flags: &[String],
     ) -> Result<()> {
         let mut all_diff = String::new();
         let mut _guards: Vec<config::TempConfig> = Vec::new();

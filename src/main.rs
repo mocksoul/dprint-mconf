@@ -68,15 +68,19 @@ fn main() -> Result<()> {
     let runner = DprintRunner::new(&config);
 
     match cli.command {
-        CliCommand::Fmt { stdin, files } => {
+        CliCommand::Fmt {
+            stdin,
+            files,
+            flags,
+        } => {
             if let Some(ref filename) = stdin {
-                runner.fmt_stdin(filename, &matcher, &config)?;
+                runner.fmt_stdin(filename, &matcher, &config, &flags)?;
             } else if files.is_empty() {
-                runner.fmt_all(&matcher, &config)?;
+                runner.fmt_all(&matcher, &config, &flags)?;
             } else {
                 let (plain_files, dirs) = split_files_and_dirs(&files);
                 if !plain_files.is_empty() {
-                    runner.fmt_files(&plain_files, &matcher, &config)?;
+                    runner.fmt_files(&plain_files, &matcher, &config, &flags)?;
                 }
                 if !dirs.is_empty() {
                     let dir_paths: Vec<_> = dirs
@@ -85,17 +89,17 @@ fn main() -> Result<()> {
                             std::fs::canonicalize(d).unwrap_or_else(|_| std::path::PathBuf::from(d))
                         })
                         .collect();
-                    runner.fmt_dirs(&dir_paths, &matcher, &config)?;
+                    runner.fmt_dirs(&dir_paths, &matcher, &config, &flags)?;
                 }
             }
         }
-        CliCommand::Check { files } => {
+        CliCommand::Check { files, flags } => {
             if files.is_empty() {
-                runner.check_all(&matcher, &config)?;
+                runner.check_all(&matcher, &config, &flags)?;
             } else {
                 let (plain_files, dirs) = split_files_and_dirs(&files);
                 if !plain_files.is_empty() {
-                    runner.check_files(&plain_files, &matcher, &config)?;
+                    runner.check_files(&plain_files, &matcher, &config, &flags)?;
                 }
                 if !dirs.is_empty() {
                     let dir_paths: Vec<_> = dirs
@@ -104,7 +108,7 @@ fn main() -> Result<()> {
                             std::fs::canonicalize(d).unwrap_or_else(|_| std::path::PathBuf::from(d))
                         })
                         .collect();
-                    runner.check_dirs(&dir_paths, &matcher, &config)?;
+                    runner.check_dirs(&dir_paths, &matcher, &config, &flags)?;
                 }
             }
         }
