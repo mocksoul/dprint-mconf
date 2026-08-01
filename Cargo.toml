@@ -12,6 +12,10 @@ description = "Multi-profile wrapper for dprint — run multiple dprint configs 
 anyhow = "1.0"
 dirs = "6.0"
 globset = "0.4"
+# Same matcher dprint uses for config excludes -- gitignore semantics (ordered
+# negation, basename vs anchored patterns, directory-only rules) are subtle
+# enough that reimplementing them would drift silently.
+ignore = "0.4"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }

@@ -7,8 +7,8 @@ A wrapper around [dprint](https://dprint.dev/) that adds multi-config support an
 - **[Per-file config profiles](#how-it-works)** — select dprint config by file path using glob rules
   ([dprint#996](https://github.com/dprint/dprint/issues/996))
 - **[Content-based matching](#content-based-matching)** — override profile by file content (e.g. skip generated files)
-- **[Local config overrides](#local-config-overrides)** — project-level `dprint.json` that merges with the matched
-  profile via `extends`
+- **[Repository configs](#repository-configs)** — a project's own `dprint.json` decides for the files it claims; your
+  profile keeps the rest
 - **[Unified diff output](#diff_pager)** — `dprint check` with real unified diff and optional pager
   ([dprint#1092](https://github.com/dprint/dprint/issues/1092))
 - **[LSP proxy](#lsp-proxy)** — spawns per-profile `dprint lsp` backends, routes requests by file URI
@@ -104,57 +104,37 @@ dprintx check > fix.patch  # unified diff to file
 
 Without `diff_pager`, `dprint check` behaves exactly like the original dprint.
 
-### Local config overrides
+### Repository configs
 
-Projects can define local formatting rules that override the matched profile.
+A committed `dprint.json` is self-contained by necessity — without its `plugins` nobody but its author could run it — so
+it already describes exactly the files its project intends to format. dprintx defers to it there, and applies your
+profile everywhere else.
 
-**How it works:**
+Per file, the repository config gives one of three answers:
 
-1. For each file being formatted, dprintx walks up the directory tree looking for `dprint.json` or `dprint.jsonc` (stops
-   at the first one found)
-2. If found, it reads the local config and injects the matched profile path into `extends`
-3. A temporary merged config is written and passed to dprint instead of the profile config
-4. The temp file is auto-deleted when the command finishes (RAII guard)
+| Repository config says | dprintx uses                | Why                                                       |
+| ---------------------- | --------------------------- | --------------------------------------------------------- |
+| listed in `excludes`   | nothing — file is untouched | the project asked for this path to be left alone          |
+| it would format this   | that config, verbatim       | the project formats the same for you as for everyone else |
+| neither                | your matched profile        | the project expressed no opinion here                     |
 
-Since dprint applies `extends` first and then overlays local settings on top, the local config takes precedence.
+The third row is the useful one. A Go project that formats only `*.go` keeps its own Go rules, while the `.md` files it
+never mentions still get formatted by your profile — in the same tree, with no configuration on your part.
 
-**Example:**
+The first row beats the second: a `.md` under `zig-out/` stays untouched even in a project that otherwise owns `.md`.
 
-```jsonc
-// ~/projects/my-app/dprint.json — only the overrides you care about
-{
-  "yaml": {
-    "commentSpacing": "ignore",
-  },
-}
-```
+**Config discovery.** dprintx walks up from each file looking for `dprint.json`, `dprint.jsonc`, `.dprint.json`,
+`.dprint.jsonc` — dprint's own list, in dprint's own priority order. When a directory holds several, the first wins and
+the rest are never read.
 
-When formatting files under `~/projects/my-app/`, dprintx generates a temporary config equivalent to:
+dprint's global config directory (`$DPRINT_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dprint`) is skipped during that walk. A
+`dprint.jsonc` there is dprint's fallback for running without `--config`, not a project's config, and treating it as one
+would make the profiles stored beside it format by whatever that fallback happens to say.
 
-```jsonc
-{
-  "extends": "/home/user/.config/dprint/dprint-default.jsonc",
-  "yaml": {
-    "commentSpacing": "ignore",
-  },
-}
-```
-
-**`extends` handling:**
-
-| Local config `extends`       | Result                                          |
-| ---------------------------- | ----------------------------------------------- |
-| absent                       | set to profile path                             |
-| `"https://example.com/base"` | `["/profile/path", "https://example.com/base"]` |
-| `["a.json", "b.json"]`       | `["/profile/path", "a.json", "b.json"]`         |
-
-The profile path is always prepended so that local settings win.
-
-**Temp file location:** `$XDG_RUNTIME_DIR/dprintx/` (per-user, mode 700). Falls back to `$TMPDIR/dprintx/` if
-`XDG_RUNTIME_DIR` is unavailable. Files are named `merged-{pid}-{seq}.json` and cleaned up automatically. Files left
-behind by a killed process are removed on the next run, matched by their pid.
-
-If no local config is found, the profile config is used directly — no temp file is created.
+**Overriding a repository.** A repository config outranks `match`, so a profile cannot claim files the project already
+owns. To bend a project's formatting to your own, edit its config — adding `extends` pointing at your profile is enough
+to bring your plugins in, since dprint gives plugins from `extends` priority over the extending config's own, while that
+config keeps the last word on settings.
 
 ### Directory arguments
 
@@ -174,13 +154,15 @@ binary files, build artifacts, and anything dprint wouldn't process on its own.
 ### LSP proxy
 
 `dprintx lsp` speaks LSP to the editor and runs one `dprint lsp` backend per effective config, spawned on first use and
-keyed by config path. Requests are routed by file URI, so one editor session can span projects with different profiles.
-[Merged configs](#local-config-overrides) are built once per project directory and reused, which keeps that count at one
-backend per project rather than one per file.
+keyed by config path. Requests are routed by file URI, so one editor session can span projects with different profiles,
+and a project formatted by [its own config](#repository-configs) gets one backend of its own.
 
-Each backend is told which directory it serves: the project root for a local config, otherwise the workspace folder the
-editor reported. That directory anchors the profile's `includes`/`excludes` globs, which is what lets a config stored in
-`~/.config/dprint/` format files anywhere on disk.
+A file the repository excludes is answered with an empty result and never reaches a backend, so the editor leaves it
+alone.
+
+Each backend is told which directory it serves: the project root when the repository's config is in use, otherwise the
+workspace folder the editor reported. That directory anchors the config's `includes`/`excludes` globs, which is what
+lets a profile stored in `~/.config/dprint/` format files anywhere on disk.
 
 ### LSP gitignore handling
 
@@ -262,7 +244,7 @@ Supported languages:
 # stdin — single file, filename is used for config matching (input is read from stdin)
 dprintx fmt --stdin path/to/file.yaml < input.yaml
 
-# fmt/check — groups files by profile, calls dprint per group
+# fmt/check — groups files by the config each routes to, calls dprint per group
 dprintx fmt
 dprintx check
 dprintx fmt file1.go file2.yaml   # explicit file list
@@ -273,11 +255,15 @@ dprintx output-file-paths
 
 # show which config is used
 dprintx config              # all profiles and rules
-dprintx config path/to/file # resolved config for a file
+dprintx config path/to/file # config a file would be formatted with
 
 # LSP proxy — spawns dprint lsp per profile, routes by file URI
 dprintx lsp
 ```
+
+`dprintx config <file>` answers with the config that would actually be used, which for a file inside a project is that
+project's config rather than the matched profile. Files a repository excludes report `(excluded by repo config)`; a
+`match` rule pointing at a `null` profile reports `(ignored)`.
 
 `dprintx check` exits with code 1 if any files need formatting.
 

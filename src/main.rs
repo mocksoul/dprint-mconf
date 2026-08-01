@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod lsp;
 mod matcher;
+mod repo_config;
 mod runner;
 
 use anyhow::{Context, Result};
@@ -191,8 +192,20 @@ fn cmd_config(matcher: &ProfileMatcher, config: &DprintxConfig, file: Option<&st
             let config_path = matcher
                 .resolve_config(&abs_path, config)
                 .with_context(|| format!("resolving config for {f}"))?;
+
+            // Report the config that would actually be used, repo routing and
+            // all -- printing the profile alone would explain nothing about a
+            // file the repository claims or excludes.
             match config_path {
-                Some(ProfileResolution::Config(p)) => println!("{}", p.display()),
+                Some(ProfileResolution::Config(profile)) => {
+                    match repo_config::verdict(&config.dprint_path(), &abs_path) {
+                        repo_config::Verdict::Excluded => {
+                            println!("(excluded by repo config)")
+                        }
+                        repo_config::Verdict::Owned(repo) => println!("{}", repo.display()),
+                        repo_config::Verdict::Unclaimed => println!("{}", profile.display()),
+                    }
+                }
                 Some(ProfileResolution::Ignore) => println!("(ignored)"),
                 None => println!("(no matching profile)"),
             }

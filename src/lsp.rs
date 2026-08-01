@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -8,8 +7,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::config::{self, DprintxConfig, ProfileResolution};
+use crate::config::{DprintxConfig, ProfileResolution};
 use crate::matcher::ProfileMatcher;
+use crate::repo_config;
 
 /// Timeout for reading LSP responses from backends.
 /// Fallback when no proxy config is loaded.
@@ -130,10 +130,6 @@ impl LspProxy {
         // Track initialize state for lazy backend spawning.
         let mut _initialized = false;
         let mut last_init_params: Option<serde_json::Value> = None;
-        // Merged configs, keyed by the directory whose local config was merged.
-        // Every message carrying a URI would otherwise write a fresh temp file
-        // and spawn a backend for it, since each file gets a unique name.
-        let mut merged_configs: HashMap<PathBuf, config::TempConfig> = HashMap::new();
         // Track URI -> languageId from textDocument/didOpen for URI rewriting.
         let mut uri_languages: HashMap<String, String> = HashMap::new();
         // Open documents, kept so a backend spawned later still learns about
@@ -324,41 +320,37 @@ impl LspProxy {
                                 }
                             };
 
-                        // Resolve effective config (merged local + profile, or just profile).
+                        // Let the repository's own config decide first: it may
+                        // claim this file, or rule it out entirely.
+                        //
                         // `workspace_root` is the directory the backend should treat as its
                         // root: the project owning the local config, or whatever the editor
                         // opened. Never the config's own directory -- a profile lives in
-                        // ~/.config/dprint and a merged config in a temp dir, and neither
-                        // contains the files being formatted.
+                        // ~/.config/dprint, which contains none of the files being formatted.
                         let mut workspace_root = None;
-                        let effective_config = match file_path.parent() {
-                            Some(parent) => match config::find_local_config(parent) {
-                                Some(local) if local != profile_config => {
-                                    let local_dir = local.parent().unwrap_or(parent).to_path_buf();
-                                    workspace_root = Some(local_dir.clone());
-                                    match merged_configs.entry(local_dir) {
-                                        Entry::Occupied(e) => e.get().path().to_path_buf(),
-                                        Entry::Vacant(e) => {
-                                            match config::build_merged_config(
-                                                parent,
-                                                &profile_config,
-                                            ) {
-                                                Ok(Some(tc)) => e.insert(tc).path().to_path_buf(),
-                                                Ok(None) => profile_config,
-                                                Err(err) => {
-                                                    eprintln!(
-                                                        "dprintx: warning: build_merged_config failed: {err}"
-                                                    );
-                                                    profile_config
-                                                }
-                                            }
-                                        }
+                        let effective_config =
+                            match repo_config::verdict(&self.dprint_bin, &file_path) {
+                                repo_config::Verdict::Excluded => {
+                                    // The project asked for this path to be left alone.
+                                    if let Some(id) = parsed.get("id").cloned() {
+                                        let null_resp = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "result": null,
+                                        });
+                                        write_lsp_message(
+                                            &stdout,
+                                            &serde_json::to_string(&null_resp)?,
+                                        )?;
                                     }
+                                    continue;
                                 }
-                                _ => profile_config,
-                            },
-                            None => profile_config,
-                        };
+                                repo_config::Verdict::Owned(repo) => {
+                                    workspace_root = repo.parent().map(|dir| dir.to_path_buf());
+                                    repo
+                                }
+                                repo_config::Verdict::Unclaimed => profile_config,
+                            };
 
                         // Ensure backend is spawned (lazily for merged configs).
                         {
